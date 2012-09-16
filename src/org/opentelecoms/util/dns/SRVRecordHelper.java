@@ -25,11 +25,13 @@
 
 package org.opentelecoms.util.dns;
 
-import java.net.Inet4Address;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
+import java.net.UnknownHostException;
 import java.util.Collection;
 import java.util.List;
+import java.util.StringTokenizer;
 import java.util.TreeSet;
 import java.util.Vector;
 import java.util.concurrent.BrokenBarrierException;
@@ -40,18 +42,29 @@ import java.util.logging.Logger;
 import org.xbill.DNS.ARecord;
 import org.xbill.DNS.ExtendedResolver;
 import org.xbill.DNS.Lookup;
+import org.xbill.DNS.Name;
 import org.xbill.DNS.Record;
 import org.xbill.DNS.Resolver;
 import org.xbill.DNS.SRVRecord;
 import org.xbill.DNS.SimpleResolver;
 import org.xbill.DNS.Type;
 
+
 public class SRVRecordHelper extends Vector<InetSocketAddress> {
-	
+
+	public interface Service {
+		String getName();
+		int getDefaultPort();
+		String getDefaultProtocol();
+	}
+
 	Logger logger = Logger.getLogger(getClass().getName());
 	
 	private static final long serialVersionUID = -2656070797887094655L;
 	final private String TAG = "SRVRecordHelper";
+	private String useProtocol;
+
+	public String getProtocol() { return useProtocol; }
 
 	private class RecordHelperThread extends Thread {
 		
@@ -103,19 +116,66 @@ public class SRVRecordHelper extends Vector<InetSocketAddress> {
 		}
 	}
 	
-	public SRVRecordHelper(String service, String protocol, String domain, int defaultPort) {
-		String mDomain = "_" + service + "._" + protocol + "." + domain;
-		
+	public SRVRecordHelper(Service service, String protocol, String domain, int port) {
+		boolean withProtocol = protocol.length() > 0;
+		boolean withPort = port > 0;
+		boolean withNumeric;
+		byte[] rawV4 = null;
+		byte[] rawV6 = null;
+
+		rawV4 = IPAddressUtil.textToNumericFormatV4(domain);
+		if ( rawV4 == null )
+			rawV6 = IPAddressUtil.textToNumericFormatV6(domain);
+
+		withNumeric = rawV4 != null || rawV6 != null;
+
 		TreeSet<SRVRecord> srvRecords = new TreeSet<SRVRecord>(new SRVRecordComparator());
 		Vector<ARecord> aRecords = new Vector<ARecord>();
-		
+
+		if ( withProtocol ) {
+			useProtocol = protocol;
+		} else {
+			if ( withNumeric || withPort) {
+				useProtocol = service.getDefaultProtocol();
+			} else {
+				// TODO try NAPTR
+				// When no NAPTR found try SRV
+				// Only SRV for now
+				useProtocol = service.getDefaultProtocol();
+			}
+		}
+
+		if ( withNumeric ) {
+			int usePort = service.getDefaultPort();
+
+			if ( withPort )
+				usePort = port;
+			else
+				usePort = service.getDefaultPort();
+
+			add(new InetSocketAddress(domain,
+						  usePort));
+			// No DNS lookup needed
+			return;
+		}
+
 		try {
-			
-			CyclicBarrier b = new CyclicBarrier(3);
-			
-			RecordHelperThread srv_t = new RecordHelperThread(b, mDomain, Type.SRV);
+			int numQueries;
+			if ( withPort )
+				numQueries = 1; // A
+			else
+				numQueries = 2; // SRV + A
+
+			CyclicBarrier b = new CyclicBarrier(numQueries + 1);
+			RecordHelperThread srv_t = null;
 			RecordHelperThread a_t = new RecordHelperThread(b, domain, Type.A);
-			srv_t.start();
+
+			if ( !withPort ) {
+				String mDomain = "_" + service.getName() + "._" + useProtocol + "." + domain;
+				srv_t = new RecordHelperThread(b, mDomain, Type.SRV);
+				srv_t.start();
+			}
+
 			a_t.start();
 			
 			// Wait for all lookups to finish
@@ -127,9 +187,15 @@ public class SRVRecordHelper extends Vector<InetSocketAddress> {
 				logger.log(Level.SEVERE, "BrokenBarrierException", e);
 			}
 
-			for (Record record : srv_t.getRecords()) {
-				if(record instanceof SRVRecord) {
-					srvRecords.add((SRVRecord)record);
+			if ( srv_t != null ) {
+				for (Record record : srv_t.getRecords()) {
+					if(record instanceof SRVRecord) {
+						srvRecords.add((SRVRecord)record);
+					}
+					if(record instanceof ARecord) {
+						// In case of additional records
+						aRecords.add((ARecord)record);
+					}
 				}
 			}
 			for (Record record : a_t.getRecords()) {
@@ -141,16 +207,46 @@ public class SRVRecordHelper extends Vector<InetSocketAddress> {
 			logger.warning("Exception during DNS lookup: " + ex.getClass().getName() + ", " + ex.getMessage());
 		}
 
-		for(SRVRecord srvRecord : srvRecords) {
-			add(new InetSocketAddress(srvRecord.getTarget().toString(), srvRecord.getPort()));
-		}
-		
-		if(defaultPort > 0 && size() == 0) {
-			for(ARecord record : aRecords) {
-				add(new InetSocketAddress(record.getName().toString(), defaultPort));
+		boolean srvFound = false;
+		if ( srvRecords.size() > 0 ) {
+			// Process SRV records
+			for(SRVRecord srvRecord : srvRecords) {
+				Name target = srvRecord.getTarget();
+				int usePort = srvRecord.getPort();
+				boolean addrFound = false;
+
+				// Check A records first
+				for(ARecord aRecord : aRecords) {
+					if ( aRecord.getName() == target ) {
+						add(new InetSocketAddress(aRecord.getAddress(), usePort));
+						addrFound = true;
+						break;
+					}
+				}
+
+				if ( addrFound )
+					continue;
+				// Lookup addresses
+				try {
+					InetAddress addr = InetAddress.getByName(target.toString());
+					add(new InetSocketAddress(addr, usePort));
+				} catch (UnknownHostException e) {
+				}
 			}
 		}
-		
-	}
 
+		if( size() == 0 ) {
+			// SRV not used or not found
+			// Fallback to using A records
+			int usePort = service.getDefaultPort();
+
+			if ( withPort )
+				usePort = port;
+			else
+				usePort = service.getDefaultPort();
+			for(ARecord record : aRecords) {
+				add(new InetSocketAddress(record.getAddress(), usePort));
+			}
+		}
+	}
 }
